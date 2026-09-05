@@ -32,24 +32,47 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 
 
 def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+    """多进程 worker：独立 login，批量拉取 baostock 数据。
+
+    防御性：每个 worker 都设置 socket 超时，并对 login / 查询做 try/except，
+    单个 worker 卡死或失败时返回空列表，不影响其他 worker。
+    """
+    import socket as _socket
+    _socket.setdefaulttimeout(15.0)
+
     import baostock as bs
-    bs.login()
+    try:
+        lg = bs.login()
+        if lg.error_code != "0":
+            return []
+    except Exception as exc:
+        print(f"[worker] bs.login() 失败: {exc}")
+        return []
+
     results = []
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
+    try:
+        for symbol, bs_code, start, end in tasks:
+            try:
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,volume,amount",
+                    start_date=start,
+                    end_date=end,
+                    frequency="d",
+                    adjustflag="1",  # 后复权
+                )
+                if rs.error_code != "0":
+                    continue
+                while rs.next():
+                    results.append([symbol] + rs.get_row_data())
+            except Exception as exc:
+                print(f"[worker] {symbol} 查询失败: {exc}")
+                continue
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
     return results
 
 
@@ -97,7 +120,7 @@ class DataEngine:
     def sync_today_bulk(self) -> int:
         """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
         from datetime import date, timedelta
-        from multiprocessing import Pool
+        import multiprocessing
 
         today_str = date.today().strftime("%Y-%m-%d")
 
@@ -128,8 +151,21 @@ class DataEngine:
         n_workers = min(8, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
-        with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
+        # 用 fork 上下文并设置硬超时，防止某个 worker 卡死拖垮主流程
+        ctx = multiprocessing.get_context("fork")
+        batch_results: list = []
+        with ctx.Pool(n_workers) as pool:
+            try:
+                async_result = pool.map_async(_bs_fetch_batch, chunks)
+                batch_results = async_result.get(timeout=180)  # 3 分钟硬超时
+            except multiprocessing.TimeoutError:
+                logger.error("sync_today_bulk 超过 3 分钟未返回，强制终止 Pool")
+                pool.terminate()
+                batch_results = []
+            except Exception as exc:
+                logger.error(f"sync_today_bulk 异常: {exc}")
+                pool.terminate()
+                batch_results = []
 
         all_rows = []
         for batch in batch_results:

@@ -1,6 +1,13 @@
-"""飞书通知模块：将选股结果通过 Webhook 推送至飞书群。"""
+"""飞书通知模块：将选股结果推送至飞书群。
+
+支持两种推送渠道（由 Settings.feishu_mode 决定）：
+  - webhook ：自定义机器人 Webhook（原有逻辑）
+  - app     ：自建应用 API（OpenAPI tenant_access_token + im/v1/messages）
+  - auto    ：优先 app（有凭据时），否则回退 webhook
+"""
 
 import json
+import time
 from datetime import date
 
 import requests
@@ -12,25 +19,31 @@ logger = get_logger(__name__)
 
 
 class FeishuNotifier:
-    """飞书 Webhook 推送器。
-
-    根据策略的 webhook_key 路由到对应的飞书机器人。
-    若 webhook_key 未在 Settings.strategy_webhooks 中配置，
-    则 fallback 到 Settings.feishu_webhook_url。
-    """
+    """飞书推送器。"""
 
     def __init__(self, settings: Settings) -> None:
-        """
-        初始化 FeishuNotifier。
-
-        Args:
-            settings: Settings 实例，提供 Webhook URL 配置。
-        """
         self.settings = settings
+        self._token: str | None = None
+        self._token_expire_at: float = 0.0
+        # 决定本次走哪条渠道
+        self._channel: str = self._resolve_channel()
 
+    def _resolve_channel(self) -> str:
+        mode = (self.settings.feishu_mode or "auto").lower()
+        if mode == "app":
+            return "app"
+        if mode == "webhook":
+            return "webhook"
+        # auto
+        if self.settings.feishu_app_id and self.settings.feishu_app_secret and (
+            self.settings.feishu_chat_id or self.settings.feishu_open_id
+        ):
+            return "app"
+        return "webhook"
+
+    # ── 共用：把代码转雪球链接 / 拿股票名 ──
     @staticmethod
     def _to_xueqiu_code(code: str) -> str:
-        """将纯数字代码转为雪球格式：6开头→SH，4/8开头→BJ，其余→SZ。"""
         if code.startswith("6"):
             return f"SH{code}"
         elif code.startswith(("4", "8")):
@@ -39,7 +52,6 @@ class FeishuNotifier:
 
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
-        """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
         import baostock as bs
         bs.login()
         mapping = {}
@@ -48,7 +60,7 @@ class FeishuNotifier:
             rs = bs.query_stock_basic(code=f"{prefix}.{code}")
             while rs.next():
                 row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
+                mapping[code] = row[1]
         bs.logout()
         return mapping
 
@@ -94,29 +106,16 @@ class FeishuNotifier:
             },
         }
 
-    def send(
-        self,
-        symbols: list[str],
-        strategy_name: str,
-        webhook_key: str = "default",
-    ) -> None:
-        """
-        将选股结果格式化为飞书卡片消息并 POST 至对应 Webhook。
+    def _build_text(self, symbols: list[str], strategy_name: str) -> str:
+        today = date.today().strftime("%Y-%m-%d")
+        names = self._get_stock_names(symbols)
+        body = " ".join(names.get(s, s) for s in symbols) if symbols else "（无选股结果）"
+        return f"📈 Sequoia-X 选股播报 | {strategy_name}\n日期: {today} | 选股数量: {len(symbols)}\n{body}"
 
-        根据 webhook_key 从 Settings 中查找专属 URL；
-        若未配置，则 fallback 到 feishu_webhook_url。
-
-        Args:
-            symbols: 选股结果代码列表。
-            strategy_name: 策略名称，用于卡片标题。
-            webhook_key: 策略标识，用于路由到对应飞书机器人。
-
-        Raises:
-            不抛出异常，HTTP 失败时记录 ERROR 日志。
-        """
+    # ── 渠道 1: Webhook ──
+    def _send_webhook(self, symbols: list[str], strategy_name: str, webhook_key: str) -> None:
         url = self.settings.get_webhook_url(webhook_key)
         payload = self._build_card(symbols, strategy_name)
-
         try:
             resp = requests.post(
                 url,
@@ -124,17 +123,84 @@ class FeishuNotifier:
                 headers={"Content-Type": "application/json"},
                 timeout=10,
             )
-            # 解析飞书真正的返回体
             resp_json = resp.json()
-
-            # 飞书真正的成功标志是内部的 code == 0
             if resp.status_code != 200 or resp_json.get("code") != 0:
                 logger.error(
-                    f"飞书推送失败 [{webhook_key}] "
-                    f"HTTP状态={resp.status_code} 飞书响应={resp.text}"
+                    f"飞书 Webhook 推送失败 [{webhook_key}] "
+                    f"HTTP={resp.status_code} body={resp.text}"
                 )
             else:
-                logger.info(f"飞书推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
-
+                logger.info(f"飞书 Webhook 推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
         except requests.RequestException as exc:
-            logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
+            logger.error(f"飞书 Webhook 请求异常 [{webhook_key}]：{exc}")
+
+    # ── 渠道 2: 自建应用 API ──
+    def _get_tenant_token(self) -> str | None:
+        if self._token and time.time() < self._token_expire_at - 300:
+            return self._token
+        try:
+            resp = requests.post(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                json={
+                    "app_id": self.settings.feishu_app_id,
+                    "app_secret": self.settings.feishu_app_secret,
+                },
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("code") != 0 or "tenant_access_token" not in data:
+                logger.error(f"获取 tenant_access_token 失败：{data}")
+                return None
+            self._token = data["tenant_access_token"]
+            self._token_expire_at = time.time() + int(data.get("expire", 7200))
+            return self._token
+        except requests.RequestException as exc:
+            logger.error(f"获取 tenant_access_token 网络异常：{exc}")
+            return None
+
+    def _send_app(self, symbols: list[str], strategy_name: str) -> None:
+        token = self._get_tenant_token()
+        if not token:
+            return
+        receive_id = self.settings.feishu_chat_id or self.settings.feishu_open_id
+        if not receive_id:
+            logger.error("app 模式未配置 FEISHU_CHAT_ID 或 FEISHU_OPEN_ID")
+            return
+        receive_id_type = "chat_id" if self.settings.feishu_chat_id else "open_id"
+        text = self._build_text(symbols, strategy_name)
+        try:
+            resp = requests.post(
+                f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json={
+                    "receive_id": receive_id,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": text}, ensure_ascii=False),
+                },
+                timeout=10,
+            )
+            data = resp.json()
+            if resp.status_code != 200 or data.get("code") != 0:
+                logger.error(
+                    f"飞书 app 推送失败 [{strategy_name}] "
+                    f"HTTP={resp.status_code} body={resp.text}"
+                )
+            else:
+                logger.info(f"飞书 app 推送成功 [{strategy_name}]，共 {len(symbols)} 只股票")
+        except requests.RequestException as exc:
+            logger.error(f"飞书 app 网络异常 [{strategy_name}]：{exc}")
+
+    # ── 入口 ──
+    def send(
+        self,
+        symbols: list[str],
+        strategy_name: str,
+        webhook_key: str = "default",
+    ) -> None:
+        if self._channel == "app":
+            self._send_app(symbols, strategy_name)
+        else:
+            self._send_webhook(symbols, strategy_name, webhook_key)

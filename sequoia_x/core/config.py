@@ -9,6 +9,18 @@ class Settings(BaseSettings):
     feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
     strategy_webhooks: dict[str, str] = {}
 
+    # 飞书自建应用 API 凭据（可选）
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_chat_id: str = ""
+    feishu_open_id: str = ""
+
+    # 推送模式：auto | webhook | app
+    #   auto  : 有 app 凭据走 app，否则走 webhook
+    #   webhook: 强制 webhook
+    #   app   : 强制自建应用 API
+    feishu_mode: str = "auto"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
