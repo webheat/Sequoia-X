@@ -1,6 +1,7 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
 import sqlite3
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -9,6 +10,47 @@ from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+# ── SQLite 健壮性配置 ──
+# journal_mode=WAL：读写不互斥，sync_today_bulk 写盘时策略仍可读
+# synchronous=NORMAL：WAL 下安全但比 FULL 快很多
+# busy_timeout：单次锁竞争最长等待，避免瞬时报"database is locked"
+_DB_OPEN_RETRIES = 3
+_DB_OPEN_BACKOFF_BASE = 0.1  # 秒，指数退避：0.1 / 0.3 / 0.9
+_RETRYABLE_OPEN_ERRORS = ("unable to open", "database is locked", "disk i/o error")
+
+
+def _open_db(path: str) -> sqlite3.Connection:
+    """打开 SQLite 连接，附带 WAL 兼容 PRAGMA，并对瞬时错误重试。
+
+    WAL 模式是 DB 级的持久设置（写入 header），只需在某次连接上设置一次。
+    busy_timeout / synchronous 是每连接 PRAGMA，每次新连接都设置。
+    """
+    last_exc: sqlite3.OperationalError | None = None
+    for attempt in range(_DB_OPEN_RETRIES):
+        try:
+            conn = sqlite3.connect(path, timeout=30.0)
+            # journal_mode 在 WAL 与 DELETE 之间切换是 DB 级持久操作，
+            # 重复执行无副作用（已 WAL 时返回 "wal"）
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            return conn
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if not any(token in msg for token in _RETRYABLE_OPEN_ERRORS):
+                raise
+            last_exc = exc
+            if attempt < _DB_OPEN_RETRIES - 1:
+                backoff = _DB_OPEN_BACKOFF_BASE * (3 ** attempt)
+                logger.warning(
+                    f"sqlite3 打开失败（{exc!s}），{backoff:.1f}s 后重试 "
+                    f"[{attempt + 1}/{_DB_OPEN_RETRIES}]"
+                )
+                time.sleep(backoff)
+    assert last_exc is not None
+    raise last_exc
 
 
 _CREATE_TABLE_SQL = """
@@ -86,14 +128,14 @@ class DataEngine:
 
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
+        with _open_db(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
     def _get_last_date(self, symbol: str) -> str | None:
-        with sqlite3.connect(self.db_path) as conn:
+        with _open_db(self.db_path) as conn:
             row = conn.execute(
                 "SELECT MAX(date) FROM stock_daily WHERE symbol = ?",
                 (symbol,),
@@ -101,7 +143,7 @@ class DataEngine:
         return row[0] if row and row[0] else None
 
     def get_ohlcv(self, symbol: str) -> pd.DataFrame:
-        with sqlite3.connect(self.db_path) as conn:
+        with _open_db(self.db_path) as conn:
             df = pd.read_sql(
                 "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
                 conn,
@@ -125,7 +167,7 @@ class DataEngine:
         today_str = date.today().strftime("%Y-%m-%d")
 
         tasks = []
-        with sqlite3.connect(self.db_path) as conn:
+        with _open_db(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
             ).fetchall()
@@ -148,7 +190,7 @@ class DataEngine:
 
         logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
 
-        n_workers = min(8, len(tasks))
+        n_workers = min(4, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
         # 用 fork 上下文并设置硬超时，防止某个 worker 卡死拖垮主流程
@@ -161,10 +203,12 @@ class DataEngine:
             except multiprocessing.TimeoutError:
                 logger.error("sync_today_bulk 超过 3 分钟未返回，强制终止 Pool")
                 pool.terminate()
+                pool.join()
                 batch_results = []
             except Exception as exc:
                 logger.error(f"sync_today_bulk 异常: {exc}")
                 pool.terminate()
+                pool.join()
                 batch_results = []
 
         all_rows = []
@@ -182,7 +226,7 @@ class DataEngine:
         df = df[df["volume"] > 0]
 
         count = len(df)
-        with sqlite3.connect(self.db_path) as conn:
+        with _open_db(self.db_path) as conn:
             for d in df["date"].unique().tolist():
                 conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
             df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
@@ -311,7 +355,7 @@ class DataEngine:
                 df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
 
                 try:
-                    with sqlite3.connect(self.db_path) as conn:
+                    with _open_db(self.db_path) as conn:
                         df.to_sql(
                             "stock_daily", conn, if_exists="append",
                             index=False, method="multi", chunksize=500,
@@ -362,7 +406,7 @@ class DataEngine:
             bs.logout()
 
     def get_local_symbols(self) -> list[str]:
-        with sqlite3.connect(self.db_path) as conn:
+        with _open_db(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT DISTINCT symbol FROM stock_daily"
             ).fetchall()
