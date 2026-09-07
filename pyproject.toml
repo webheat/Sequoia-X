@@ -10,6 +10,7 @@ dependencies = [
     "rich>=13.0",
     "pandas>=2.0",
     "requests>=2.31",
+    "PySocks>=1.7",  # _run_with_socks.py: SOCKS5 代理注入
 ]
 
 [project.optional-dependencies]
