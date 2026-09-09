@@ -27,6 +27,7 @@ from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
+from sequoia_x.strategy.zhao_style import ZhaoStyleStrategy
 
 
 def main() -> None:
@@ -70,6 +71,7 @@ def main() -> None:
             LimitUpShakeoutStrategy(engine=engine, settings=settings),
             UptrendLimitDownStrategy(engine=engine, settings=settings),
             RpsBreakoutStrategy(engine=engine, settings=settings),
+            ZhaoStyleStrategy(engine=engine, settings=settings),
             PrivatePlacementStrategy(engine=engine, settings=settings),
         ]
 
