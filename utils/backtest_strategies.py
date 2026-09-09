@@ -346,14 +346,23 @@ def render_report(result: dict) -> str:
     n_total = result["n_test_points"]
     n_insufficient = len(insufficient)
     n_in_kdb = result["n_in_stock_daily"]
-    # 交易日期范围
-    test_points_dates = sorted({d for d, _, _ in [(p[0], p[1], p[2]) for p in [(d, s, n) for d, s, n in [(r[0], r[1], r[2]) for r in []]]})  # noqa
+    # 交易日期范围（直接查 trades.db，不依赖 test_points 重建）
+    conn = sqlite3.connect(TRADES_DB)
+    try:
+        dmin, dmax = conn.execute(
+            "SELECT MIN(操作日期), MAX(操作日期) FROM trades WHERE 操作日期 IS NOT NULL"
+        ).fetchone()
+    finally:
+        conn.close()
 
     lines: list[str] = []
     lines.append("# Sequoia-X 策略回测报告")
     lines.append("")
     lines.append(
         f"- 数据源：`trades.db`（950 行原始交易 → **{n_total}** 个去重 (股票, 日期) 测试点）"
+    )
+    lines.append(
+        f"- 交易日期区间：**{dmin} → {dmax}**"
     )
     lines.append(
         f"- 涉及股票：**{result['n_unique_symbols']}** 只；其中在 `sequoia_v2.db` 里有 K 线的：**{n_in_kdb}** 只"
@@ -438,8 +447,8 @@ def render_report(result: dict) -> str:
     lines.append(f"- 6 策略检测样本合计：{n_checked_total}（每策略 {n_checked_total // 6}）")
     lines.append(f"- 命中合计：{n_hits_total}（每策略独立计数，同一 (sym,date) 可被多策略同时命中）")
     lines.append("")
-    lines.append("> 加和校验：`{n_insufficient} + {n_checked_total // 6} = {n_insufficient + n_checked_total // 6} = {n_total}`".format(
-        n_insufficient=n_insufficient, n_checked_total=n_checked_total, n_total=n_total
+    lines.append("> 加和校验：`{} + {} = {} = {}`（数据不足 + 已检测 = 总测试点）".format(
+        n_insufficient, n_checked_total // 6, n_insufficient + n_checked_total // 6, n_total
     ))
     lines.append("")
 
