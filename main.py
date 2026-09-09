@@ -19,6 +19,7 @@ from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.notify.feishu import FeishuNotifier
+from sequoia_x.notify.feishu_bitable import append_run_to_bitable
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
@@ -91,6 +92,15 @@ def main() -> None:
                     strategy_name=strategy_name,
                     webhook_key=strategy.webhook_key,
                 )
+                # 同步追加到飞书多维表格（每日选股流水 + 每日选股明细）
+                try:
+                    append_run_to_bitable(
+                        strategy_name=strategy_name,
+                        symbols=selected,
+                        run_date=date.today().isoformat(),
+                    )
+                except Exception as exc:
+                    logger.warning(f"{strategy_name} 推送到飞书 bitable 失败：{exc}")
             else:
                 logger.info(f"{strategy_name} 无选股结果，跳过推送")
 
