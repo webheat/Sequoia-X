@@ -103,10 +103,40 @@ Sequoia-X/
 │   │   ├── limit_up_shakeout.py # 涨停洗盘策略
 │   │   ├── uptrend_limit_down.py # 上升跌停策略
 │   │   └── rps_breakout.py      # RPS 突破策略
-│   └── notify/
+│   ├── notify/
 │       └── feishu.py            # 飞书 Webhook 推送
+├── utils/
+│   └── test_data_source.py       # 数据源连通性 + 数据正确性自检
 └── tests/                       # 属性测试（hypothesis）
 ```
+
+---
+
+## 开发自检
+
+数据源（baostock）的连通性与数据正确性自检：
+
+```bash
+# 直连（默认）
+.venv/bin/python utils/test_data_source.py
+
+# 验证代理路径
+USE_SOCKS5=1 .venv/bin/python utils/test_data_source.py
+
+# 自定义抽样股票 / 回看天数
+.venv/bin/python utils/test_data_source.py --symbol sz.000001 --days 60
+
+# 只跑数据层（跳过 DNS/TCP/HTTP 噪声）
+.venv/bin/python utils/test_data_source.py --skip-network
+```
+
+脚本可执行权限已开，已激活 venv 时可直接：
+
+```bash
+./utils/test_data_source.py
+```
+
+退出码：`0` 全部通过 / `1` 有失败项 / `2` 依赖缺失（脚本会自动探测并提示修复命令）。
 
 ---
 

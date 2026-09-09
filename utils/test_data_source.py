@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Sequoia-X 数据源连通性 + 数据正确性自检。
 
 覆盖：
@@ -5,10 +6,14 @@
   2. baostock：login + query_stock_basic(全市场) + query_history_k_data_plus(单股)
   3. 数据正确性：行数、列完整性、OHLCV 合理性、最新交易日时延
 
-默认走当前 socket 配置（直连）。如要验证代理路径：
-    USE_SOCKS5=1 .venv/bin/python utils/test_data_source.py
+推荐运行方式（已自带虚拟环境）：
+    .venv/bin/python utils/test_data_source.py
+    USE_SOCKS5=1 .venv/bin/python utils/test_data_source.py   # 验证代理路径
 
-退出码：0 全部通过；1 有失败项。
+可执行权限开启后也能直接跑（前提是已激活 venv）：
+    ./utils/test_data_source.py
+
+退出码：0 全部通过；1 有失败项；2 依赖缺失。
 """
 from __future__ import annotations
 
@@ -20,8 +25,58 @@ import time
 import urllib.request
 from datetime import date, timedelta
 
-import baostock as bs
-import pandas as pd
+# ---------- 依赖自检：缺失时给出修复提示，避免裸 python3 跑挂 ----------
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_VENV_PY = os.path.join(_PROJECT_ROOT, ".venv", "bin", "python")
+
+
+def _missing_deps() -> list[str]:
+    return [m for m in ("baostock", "pandas") if _cannot_import(m)]
+
+
+def _cannot_import(mod: str) -> bool:
+    try:
+        __import__(mod)
+    except ImportError:
+        return True
+    return False
+
+
+def _ensure_deps() -> None:
+    missing = _missing_deps()
+    if not missing:
+        return
+    lines = [
+        "",
+        "[ERROR] 缺少依赖：" + ", ".join(missing),
+        f"当前解释器：{sys.executable}",
+        "",
+    ]
+    if os.path.exists(_VENV_PY):
+        lines += [
+            "项目自带虚拟环境，请改用：",
+            f"  .venv/bin/python utils/test_data_source.py",
+            "",
+            "或激活 venv 后再跑：",
+            f"  source .venv/bin/activate && python utils/test_data_source.py",
+            "",
+        ]
+    else:
+        lines += [
+            "请先安装依赖：",
+            "  uv sync",
+            "  # 或者",
+            "  pip install baostock pandas",
+            "",
+        ]
+    sys.stderr.write("\n".join(lines))
+    sys.exit(2)
+
+
+_ensure_deps()
+
+import baostock as bs  # noqa: E402  (deps guaranteed by _ensure_deps)
+import pandas as pd  # noqa: E402
 
 # ---------- 可选 SOCKS5 注入（与 _run_with_socks.py 行为一致） ----------
 if os.getenv("USE_SOCKS5") == "1":
