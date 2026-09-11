@@ -52,16 +52,52 @@ class FeishuNotifier:
 
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
+        """股票代码 → 中文名。baostock 抽风时返回部分结果，绝不抛异常。
+
+        baostock 偶发 "接收数据异常" / "timed out" 时，
+        query_stock_basic 会返回不完整的 row（get_row_data 是空列表或长度不足），
+        直接 row[1] 会 IndexError，进而让整个 main 流程挂掉。
+        这里逐 symbol 兜底：单个失败不影响其他，且 login/logout 也包起来。
+        返回值允许有缺失 → caller 的 names.get(code, fallback) 兜底显示。
+        """
+        if not symbols:
+            return {}
+        import socket as _socket
+        _socket.setdefaulttimeout(15.0)  # 与 engine._bs_fetch_batch 同语义
         import baostock as bs
-        bs.login()
-        mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]
-        bs.logout()
+        mapping: dict[str, str] = {}
+        try:
+            lg = bs.login()
+            if lg.error_code != "0":
+                logger.warning(f"baostock login 失败: {lg.error_msg}，股票名将为空")
+                return mapping
+        except Exception as exc:
+            logger.warning(f"baostock login 异常: {exc}，股票名将为空")
+            return mapping
+
+        try:
+            for code in symbols:
+                prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                try:
+                    rs = bs.query_stock_basic(code=f"{prefix}.{code}")
+                except Exception as exc:
+                    logger.warning(f"baostock query_stock_basic({code}) 异常: {exc}")
+                    continue
+                try:
+                    while rs.next():
+                        row = rs.get_row_data()
+                        if len(row) > 1 and row[1]:
+                            mapping[code] = row[1]
+                            break  # 一只代码只取第一条
+                except Exception as exc:
+                    logger.warning(f"baostock 解析 {code} 返回数据异常: {exc}")
+                    continue
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
+
         return mapping
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
