@@ -76,20 +76,58 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。
 
-    防御性：每个 worker 都设置 socket 超时，并对 login / 查询做 try/except，
-    单个 worker 卡死或失败时返回空列表，不影响其他 worker。
+    防御性：
+    - 每个 worker 设置 socket 超时
+    - login 失败重试 2 次（指数退避），单次 baostock 抽风不至于整批返空
+    - login 成功后对 baostock 单例 socket 显式 settimeout，覆盖历史无超时 socket
+    - 单个 worker 卡死或失败时返回空列表，不影响其他 worker
     """
     import socket as _socket
     _socket.setdefaulttimeout(15.0)
 
     import baostock as bs
-    try:
-        lg = bs.login()
-        if lg.error_code != "0":
-            return []
-    except Exception as exc:
-        print(f"[worker] bs.login() 失败: {exc}")
+    import baostock.common.context as _bsctx
+
+    def _close_residual_socket() -> None:
+        """关掉 baostock 单例 socket，不关下次 login 会复用可能已损坏的连接。"""
+        sock = getattr(_bsctx, "default_socket", None)
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except OSError:
+            pass
+        try:
+            delattr(_bsctx, "default_socket")
+        except AttributeError:
+            pass
+
+    # login 重试：最多 3 次，每次失败前彻底关闭旧 socket 让下次 login 重建
+    lg = None
+    last_err: str | None = None
+    for attempt in range(3):
+        _close_residual_socket()
+        try:
+            lg = bs.login()
+            last_err = None if lg.error_code == "0" else lg.error_msg
+        except Exception as exc:
+            last_err = f"exception: {exc}"
+            lg = None
+        if last_err is None:
+            break
+        if attempt < 2:
+            time.sleep(2 ** attempt)
+    if lg is None or lg.error_code != "0":
+        print(f"[worker] bs.login() 三次均失败: {last_err}")
         return []
+
+    # login 成功后：显式给单例 socket 设超时，覆盖"之前已存在无超时 socket"的情况
+    sock = getattr(_bsctx, "default_socket", None)
+    if sock is not None:
+        try:
+            sock.settimeout(15.0)
+        except OSError:
+            pass
 
     results = []
     try:
