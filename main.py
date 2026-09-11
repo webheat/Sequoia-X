@@ -79,19 +79,29 @@ def main() -> None:
         notifier = FeishuNotifier(settings)
 
         # 5. 遍历策略，有结果则推送至对应机器人
+        # 单策略异常不影响其他策略（关键：9/11 那次卡在 MaVolume 的 baostock 抽风上
+        # 导致剩下 7 个策略全没跑，bitable 也 0 行）
         for strategy in strategies:
             strategy_name = type(strategy).__name__
-            logger.info(f"执行策略：{strategy_name}")
+            try:
+                logger.info(f"执行策略：{strategy_name}")
+                selected: list[str] = strategy.run()
+                logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
 
-            selected: list[str] = strategy.run()
-            logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
+                if not selected:
+                    logger.info(f"{strategy_name} 无选股结果，跳过推送")
+                    continue
 
-            if selected:
-                notifier.send(
-                    symbols=selected,
-                    strategy_name=strategy_name,
-                    webhook_key=strategy.webhook_key,
-                )
+                # 飞书推送失败不应阻塞 bitable 写入
+                try:
+                    notifier.send(
+                        symbols=selected,
+                        strategy_name=strategy_name,
+                        webhook_key=strategy.webhook_key,
+                    )
+                except Exception as exc:
+                    logger.warning(f"{strategy_name} 飞书推送异常（非致命）: {exc}")
+
                 # 同步追加到飞书多维表格（每日选股流水 + 每日选股明细）
                 try:
                     append_run_to_bitable(
@@ -101,8 +111,10 @@ def main() -> None:
                     )
                 except Exception as exc:
                     logger.warning(f"{strategy_name} 推送到飞书 bitable 失败：{exc}")
-            else:
-                logger.info(f"{strategy_name} 无选股结果，跳过推送")
+            except Exception as exc:
+                # 单策略崩溃：记异常、继续下一个，绝不让整个 main 流程挂掉
+                logger.exception(f"{strategy_name} 执行失败（已跳过）: {exc}")
+                continue
 
     except Exception:
         try:
