@@ -265,9 +265,22 @@ class DataEngine:
 
         count = len(df)
         with _open_db(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
+            # 幂等 upsert：先写 TEMP 表，再 INSERT OR REPLACE 回主表。
+            # 千万不要 DELETE 整日期：sync_today_bulk 实际只补了"上次同步失败"的
+            # 一部分股票，如果按日期 DELETE 再 INSERT，会把日期维度上其他股票的
+            # 现有数据也删掉（2026-09-11 那次事故就是这么丢的 5 天 × 583 股数据）。
+            # 表上有 UNIQUE(symbol, date)，INSERT OR REPLACE 走单行 upsert。
+            conn.execute("CREATE TEMP TABLE _upsert AS SELECT * FROM stock_daily WHERE 0")
+            df.to_sql(
+                "_upsert", conn, if_exists="append",
+                index=False, method="multi", chunksize=500,
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO stock_daily "
+                "(symbol, date, open, high, low, close, volume, turnover) "
+                "SELECT symbol, date, open, high, low, close, volume, turnover FROM _upsert"
+            )
+            conn.execute("DROP TABLE _upsert")
             conn.commit()
 
         logger.info(f"sync_today_bulk: 写入 {count} 条数据")
