@@ -1,5 +1,7 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
+import gc
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -149,11 +151,57 @@ def _bs_fetch_batch(tasks: list) -> list:
                 print(f"[worker] {symbol} 查询失败: {exc}")
                 continue
     finally:
+        # 9/11 18:07 失败时主进程触发 `OSError: [Errno 24] Too many open files:
+        # .../netrc.py`，根因是 fork 后子进程未显式释放 importlib 副作用 fd。
+        # logout 已 close baostock 单例 socket，此处再 gc + 二次 close 兜底，
+        # 并清掉对 default_socket 的引用，确保 fork 出去的进程从干净状态起。
         try:
             bs.logout()
         except Exception:
             pass
+        try:
+            sock = getattr(_bsctx, "default_socket", None)
+            if sock is not None:
+                sock.close()
+        except OSError:
+            pass
+        try:
+            delattr(_bsctx, "default_socket")
+        except AttributeError:
+            pass
+        # 强制回收 baostock 单例 / ResultData / netrc 等本地引用
+        gc.collect()
     return results
+
+
+def _close_inherited_fds() -> None:
+    """fork 出 worker 前，关闭父进程 >= 10 的 fd，避免子进程继承膨胀。
+
+    POSIX 0/1/2 是 stdin/stdout/stderr 必须保留；>= 10 的 fd 大多是模块导入副作用
+    （netrc / .pyc 缓存 / 临时 .env 文件 / baostock 单例 socket / SQLite WAL/SHM），
+    子进程内 _bs_fetch_batch / _open_db 会按需重新打开，关闭父进程旧 fd 无副作用。
+    """
+    fd_dir = f"/proc/{os.getpid()}/fd"
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return
+    closed = 0
+    for name in names:
+        try:
+            n = int(name)
+        except ValueError:
+            continue
+        if n < 10:
+            continue
+        try:
+            os.close(n)
+            closed += 1
+        except OSError:
+            # fd 可能已经被 GC 关闭，忽略
+            pass
+    if closed:
+        logger.info(f"fork 前关闭父进程 {closed} 个 fd（>=10），减少 worker fd 继承")
 
 
 class DataEngine:
@@ -228,8 +276,15 @@ class DataEngine:
 
         logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
 
-        n_workers = min(4, len(tasks))
+        # 9/11 18:07 cron 失败时主进程触发 `OSError: [Errno 24] Too many open files`：
+        # fork 出去的 worker 继承父进程全部 fd（含 baostock 单例 socket / SQLite WAL），
+        # 各自 import baostock → requests → netrc.py 又新开 fd，叠加触发上限。
+        # 减半到 2 worker + fork 前关闭父进程 >= 10 的 fd，把继承面降到最小。
+        # 0/1/2 是 stdin/stdout/stderr 必须保留；SQLite/baostock fd 都 >= 10，子进程
+        # 内 _bs_fetch_batch / _open_db 会按需重新打开，关闭父进程旧 fd 无副作用。
+        n_workers = min(2, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
+        _close_inherited_fds()
 
         # 用 fork 上下文并设置硬超时，防止某个 worker 卡死拖垮主流程
         ctx = multiprocessing.get_context("fork")

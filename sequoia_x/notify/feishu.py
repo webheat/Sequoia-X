@@ -27,6 +27,11 @@ class FeishuNotifier:
         self._token_expire_at: float = 0.0
         # 决定本次走哪条渠道
         self._channel: str = self._resolve_channel()
+        # 9/11 18:07 失败根因之一：8 个策略每个推送都重新 bs.login/logout，
+        # 每次 session 重新走 baostock socket + 触发 importlib netrc.py，
+        # 在 fd 已紧张的进程里直接把 fd 打爆。改成实例级缓存：整次 main 流程
+        # 只在第一次推送时打开 baostock session，后续 7 次直接命中。
+        self._name_cache: dict[str, str] = {}
 
     def _resolve_channel(self) -> str:
         mode = (self.settings.feishu_mode or "auto").lower()
@@ -50,8 +55,7 @@ class FeishuNotifier:
             return f"BJ{code}"
         return f"SZ{code}"
 
-    @staticmethod
-    def _get_stock_names(symbols: list[str]) -> dict[str, str]:
+    def _get_stock_names(self, symbols: list[str]) -> dict[str, str]:
         """股票代码 → 中文名。baostock 抽风时返回部分结果，绝不抛异常。
 
         baostock 偶发 "接收数据异常" / "timed out" 时，
@@ -59,46 +63,72 @@ class FeishuNotifier:
         直接 row[1] 会 IndexError，进而让整个 main 流程挂掉。
         这里逐 symbol 兜底：单个失败不影响其他，且 login/logout 也包起来。
         返回值允许有缺失 → caller 的 names.get(code, fallback) 兜底显示。
+
+        实例级缓存：同一 FeishuNotifier 实例（main.py:84 共用一个）跨策略共享，
+        第一次调用走 baostock 拉全量，后续命中直接返回。9/11 fd 24 路径之一：
+        8 策略 × 1 session → 8 次 baostock login/logout，每次都触发 importlib netrc。
         """
         if not symbols:
             return {}
+        # 命中缓存：未命中的 symbol 才需要 baostock
+        missing = [s for s in symbols if s not in self._name_cache]
+        if not missing:
+            return {s: self._name_cache[s] for s in symbols}
+
         import socket as _socket
         _socket.setdefaulttimeout(15.0)  # 与 engine._bs_fetch_batch 同语义
         import baostock as bs
-        mapping: dict[str, str] = {}
+        new_mapping: dict[str, str] = {}
         try:
-            lg = bs.login()
-            if lg.error_code != "0":
-                logger.warning(f"baostock login 失败: {lg.error_msg}，股票名将为空")
-                return mapping
-        except Exception as exc:
-            logger.warning(f"baostock login 异常: {exc}，股票名将为空")
-            return mapping
-
-        try:
-            for code in symbols:
-                prefix = "sh" if code.startswith(("6", "9")) else "sz"
-                try:
-                    rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-                except Exception as exc:
-                    logger.warning(f"baostock query_stock_basic({code}) 异常: {exc}")
-                    continue
-                try:
-                    while rs.next():
-                        row = rs.get_row_data()
-                        if len(row) > 1 and row[1]:
-                            mapping[code] = row[1]
-                            break  # 一只代码只取第一条
-                except Exception as exc:
-                    logger.warning(f"baostock 解析 {code} 返回数据异常: {exc}")
-                    continue
-        finally:
             try:
-                bs.logout()
-            except Exception:
-                pass
+                lg = bs.login()
+                if lg.error_code != "0":
+                    logger.warning(f"baostock login 失败: {lg.error_msg}，股票名将为空")
+                    # login 失败也写入 cache（空值）避免下次再尝试
+                    self._name_cache.update({s: s for s in missing})
+                    return {s: self._name_cache.get(s, s) for s in symbols}
+            except Exception as exc:
+                logger.warning(f"baostock login 异常: {exc}，股票名将为空")
+                self._name_cache.update({s: s for s in missing})
+                return {s: self._name_cache.get(s, s) for s in symbols}
 
-        return mapping
+            try:
+                for code in missing:
+                    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                    try:
+                        rs = bs.query_stock_basic(code=f"{prefix}.{code}")
+                    except BaseException as exc:
+                        # 9/11 18:10 traceback 末端是 baostock 库自身 IndexError
+                        # （metadata/stock_metadata.py:202 data.setData 越界），
+                        # 继承 LookupError → Exception，用 BaseException 兜底确保
+                        # 不会因为一个库 bug 把整个 main 流程挂掉。
+                        logger.warning(f"baostock query_stock_basic({code}) 异常: {exc}")
+                        continue
+                    try:
+                        while rs.next():
+                            row = rs.get_row_data()
+                            if len(row) > 1 and row[1]:
+                                new_mapping[code] = row[1]
+                                break  # 一只代码只取第一条
+                    except Exception as exc:
+                        logger.warning(f"baostock 解析 {code} 返回数据异常: {exc}")
+                        continue
+            finally:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
+        except BaseException as exc:
+            # 兜底再罩一层：万一 baostock 整个连接断了 / GC 出错 / KeyboardInterrupt 之外
+            # 的系统异常，绝不让 _get_stock_names 把 FeishuNotifier.send 抛到 main 顶层。
+            logger.warning(f"_get_stock_names 未捕获异常（已降级返回空映射）: {exc}")
+            self._name_cache.update({s: s for s in missing})
+            return {s: self._name_cache.get(s, s) for s in symbols}
+
+        # 写入缓存（包含没查到的 fallback，避免下次重复尝试）
+        for s in missing:
+            self._name_cache[s] = new_mapping.get(s, s)
+        return {s: self._name_cache.get(s, s) for s in symbols}
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
         today = date.today().strftime("%Y-%m-%d")

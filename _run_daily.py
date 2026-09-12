@@ -97,6 +97,13 @@ def _run_once() -> int:
     _log(f"启动 main.py: {' '.join(cmd)}")
     start = time.time()
 
+    # 9/11 18:07 cron 失败时主进程触发 `OSError: [Errno 24] Too many open files`。
+    # _run_daily 自身是 Popen 父进程，Popen 默认 close_fds=True 不会把 fd 透给 main.py，
+    # 但 _run_daily 自己的 import 链也开了不少 fd（socks / 日志 handler / .env），
+    # 这里记录 baseline + main 退出后的 delta，方便对账。
+    _fd_pre = _count_fds()
+    _log(f"Popen 前 fd={_fd_pre}")
+
     try:
         proc = subprocess.Popen(cmd, cwd=str(PROJECT_DIR))
     except OSError as exc:
@@ -122,8 +129,16 @@ def _run_once() -> int:
 
     rc = proc.returncode
     elapsed = time.time() - start
-    _log(f"main.py 退出码 {rc}，耗时 {elapsed:.1f}s")
+    _fd_post = _count_fds()
+    _log(f"main.py 退出码 {rc}，耗时 {elapsed:.1f}s，fd={_fd_post} (delta={_fd_post - _fd_pre})")
     return rc
+
+
+def _count_fds() -> int:
+    try:
+        return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    except OSError:
+        return -1
 
 
 def main() -> None:

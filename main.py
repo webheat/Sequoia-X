@@ -6,6 +6,7 @@
 """
 
 import argparse
+import os
 import sys
 from dotenv import load_dotenv
 load_dotenv()
@@ -31,6 +32,21 @@ from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 from sequoia_x.strategy.zhao_style import ZhaoStyleStrategy
 
 
+# ── fd 观测 ──
+# 9/11 18:07 cron 失败时主进程触发 `OSError: [Errno 24] Too many open files`，
+# 原因是 fork 出去的 worker 继承父进程全部 fd + import baostock/requests 副作用叠加。
+# 这里记录 baseline + sync_today_bulk 后 delta，未来再次撞顶时第一时间定位。
+_fd_logger = get_logger("sequoia_x.fd_monitor")
+_FD_BASELINE = 0
+
+
+def _count_fds() -> int:
+    try:
+        return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+    except OSError:
+        return -1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sequoia-X V2 选股系统")
     parser.add_argument(
@@ -47,6 +63,9 @@ def main() -> None:
         # 2. 初始化日志
         logger = get_logger(__name__)
         logger.info("Sequoia-X V2 启动")
+        global _FD_BASELINE
+        _FD_BASELINE = _count_fds()
+        _fd_logger.info(f"main.py 启动 baseline fd={_FD_BASELINE}")
 
         # 3. 初始化数据引擎
         engine = DataEngine(settings)
@@ -63,6 +82,11 @@ def main() -> None:
         logger.info("开始拉取最新快照...")
         count = engine.sync_today_bulk()
         logger.info(f"快照同步完成，写入 {count} 只股票")
+        _fd_after = _count_fds()
+        _fd_delta = _fd_after - _FD_BASELINE if (_FD_BASELINE >= 0 and _fd_after >= 0) else 0
+        _fd_logger.info(f"sync_today_bulk 完成 fd={_fd_after} delta={_fd_delta}")
+        if _fd_delta > 50:
+            _fd_logger.warning(f"sync_today_bulk 后 fd 增长异常 ({_fd_delta})，留意 OSError 24 风险")
 
         # 4. 策略列表（新增策略在此追加即可）
         strategies: list[BaseStrategy] = [
