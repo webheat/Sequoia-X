@@ -88,6 +88,17 @@ def main() -> None:
         if _fd_delta > 50:
             _fd_logger.warning(f"sync_today_bulk 后 fd 增长异常 ({_fd_delta})，留意 OSError 24 风险")
 
+        # 9/14 fd 撞顶修复：策略循环前一次性读全表 OHLCV 到内存，6 策略 × 666 symbol
+        # 后续 get_ohlcv 走 dict 命中（0 fd 开销），替代逐 symbol with sqlite3.connect()
+        # 在 Py 3.14 下泄漏 fd 的旧路径。失败自动 fall back（旧行为仍工作）。
+        _fd_pre_preload = _count_fds()
+        engine.preload_all_ohlcv()
+        _fd_post_preload = _count_fds()
+        _fd_logger.info(
+            f"preload_all_ohlcv 完成 fd={_fd_post_preload} "
+            f"delta={_fd_post_preload - _fd_pre_preload}"
+        )
+
         # 4. 策略列表（新增策略在此追加即可）
         strategies: list[BaseStrategy] = [
             MaVolumeStrategy(engine=engine, settings=settings),
@@ -107,6 +118,7 @@ def main() -> None:
         # 导致剩下 7 个策略全没跑，bitable 也 0 行）
         for strategy in strategies:
             strategy_name = type(strategy).__name__
+            _fd_pre_strategy = _count_fds()
             try:
                 logger.info(f"执行策略：{strategy_name}")
                 selected: list[str] = strategy.run()
@@ -139,10 +151,28 @@ def main() -> None:
                 # 单策略崩溃：记异常、继续下一个，绝不让整个 main 流程挂掉
                 logger.exception(f"{strategy_name} 执行失败（已跳过）: {exc}")
                 continue
+            finally:
+                _fd_post_strategy = _count_fds()
+                _strategy_fd_delta = (
+                    _fd_post_strategy - _fd_pre_strategy
+                    if (_fd_pre_strategy >= 0 and _fd_post_strategy >= 0)
+                    else 0
+                )
+                _fd_logger.info(
+                    f"{strategy_name} 完成 fd={_fd_post_strategy} "
+                    f"delta={_strategy_fd_delta}"
+                )
+                if _strategy_fd_delta > 50:
+                    _fd_logger.warning(
+                        f"{strategy_name} fd 增长异常 ({_strategy_fd_delta})，"
+                        f"留意 OSError 24 风险"
+                    )
 
     except Exception:
         try:
             _logger = get_logger(__name__)
+            _fd_at_crash = _count_fds()
+            _fd_logger.error(f"主流程崩溃时 fd={_fd_at_crash}")
             _logger.exception("主流程发生未捕获异常，程序终止")
         except Exception:
             import traceback
