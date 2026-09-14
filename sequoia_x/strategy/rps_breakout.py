@@ -1,5 +1,4 @@
 import pandas as pd
-import sqlite3
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.core.logger import get_logger
 
@@ -14,9 +13,10 @@ class RpsBreakoutStrategy(BaseStrategy):
     rps_threshold: int = 90
 
     def run(self) -> list[str]:
+        # 9/14 fd 撞顶修复：之前每次都新开 sqlite3 连接，Py 3.14 下不 close。
+        # 改用 engine.get_all_close_high() 复用 preload 缓存，0 fd 开销。
         try:
-            with sqlite3.connect(self.engine.db_path) as conn:
-                df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
+            df = self.engine.get_all_close_high()
         except Exception as exc:
             logger.error(f"读取数据库失败: {exc}")
             return []
