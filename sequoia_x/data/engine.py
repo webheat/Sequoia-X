@@ -42,12 +42,18 @@ _DB_OPEN_BACKOFF_BASE = 0.1  # 秒，指数退避：0.1 / 0.3 / 0.9
 _RETRYABLE_OPEN_ERRORS = ("unable to open", "database is locked", "disk i/o error")
 
 
-def _open_db(path: str) -> sqlite3.Connection:
-    """打开 SQLite 连接，附带 WAL 兼容 PRAGMA，并对瞬时错误重试。
+@contextmanager
+def _open_db(path: str):
+    """打开 SQLite 连接（context manager），附带 WAL 兼容 PRAGMA，并对瞬时错误重试。
+
+    Python 3.14 下 ``sqlite3.Connection.__exit__`` 不会自动 close，with-block 退出后
+    fd 仍持有——单次连接泄漏 1 fd，6 策略 × 666 symbol 累积可达 4000+。
+    这里用 try/finally 显式 ``conn.close()``，确保 fd 不泄漏。
 
     WAL 模式是 DB 级的持久设置（写入 header），只需在某次连接上设置一次。
     busy_timeout / synchronous 是每连接 PRAGMA，每次新连接都设置。
     """
+    conn: sqlite3.Connection | None = None
     last_exc: sqlite3.OperationalError | None = None
     for attempt in range(_DB_OPEN_RETRIES):
         try:
@@ -163,6 +169,8 @@ def _bs_fetch_batch(tasks: list) -> list:
     results = []
     try:
         for symbol, bs_code, start, end in tasks:
+            # per-task 计时：单只查询超 30s 主动放弃，避免 baostock hang 拖垮整批
+            task_start = time.monotonic()
             try:
                 rs = bs.query_history_k_data_plus(
                     bs_code,
@@ -176,6 +184,12 @@ def _bs_fetch_batch(tasks: list) -> list:
                     continue
                 while rs.next():
                     results.append([symbol] + rs.get_row_data())
+                    if time.monotonic() - task_start > _BS_TASK_TIMEOUT_S:
+                        logger.warning(
+                            f"[worker] {symbol} 单只查询超过 {_BS_TASK_TIMEOUT_S}s，"
+                            f"提前结束（bs 可能 hang）"
+                        )
+                        break
             except Exception as exc:
                 print(f"[worker] {symbol} 查询失败: {exc}")
                 continue
@@ -373,9 +387,13 @@ class DataEngine:
         with ctx.Pool(n_workers) as pool:
             try:
                 async_result = pool.map_async(_bs_fetch_batch, chunks)
-                batch_results = async_result.get(timeout=180)  # 3 分钟硬超时
+                # 9/14 修复：3 → 5 分钟——baostock hang 时 3 分钟临界，
+                # 5 分钟留出重连/重试余量；单只 per-task 30s timeout 已在 _bs_fetch_batch 内做。
+                batch_results = async_result.get(timeout=_SYNC_BULK_TIMEOUT_S)
             except multiprocessing.TimeoutError:
-                logger.error("sync_today_bulk 超过 3 分钟未返回，强制终止 Pool")
+                logger.error(
+                    f"sync_today_bulk 超过 {_SYNC_BULK_TIMEOUT_S}s 未返回，强制终止 Pool"
+                )
                 pool.terminate()
                 pool.join()
                 batch_results = []
