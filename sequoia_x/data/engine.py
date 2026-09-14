@@ -4,6 +4,7 @@ import gc
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -38,7 +39,7 @@ def _open_db(path: str) -> sqlite3.Connection:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=30000")
-            return conn
+            break
         except sqlite3.OperationalError as exc:
             msg = str(exc).lower()
             if not any(token in msg for token in _RETRYABLE_OPEN_ERRORS):
@@ -51,8 +52,18 @@ def _open_db(path: str) -> sqlite3.Connection:
                     f"[{attempt + 1}/{_DB_OPEN_RETRIES}]"
                 )
                 time.sleep(backoff)
-    assert last_exc is not None
-    raise last_exc
+    if conn is None:
+        assert last_exc is not None
+        raise last_exc
+    try:
+        yield conn
+    finally:
+        # 9/14 fd 撞顶修复：Python 3.14 下 __exit__ 不 close，必须显式释放。
+        # 关闭触发 SQLite 把 WAL buffer flush 回 -wal 文件，下次连接仍能看到。
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 _CREATE_TABLE_SQL = """
