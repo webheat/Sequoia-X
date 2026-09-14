@@ -15,6 +15,24 @@ from sequoia_x.core.logger import get_logger
 logger = get_logger(__name__)
 
 
+# ── sync_today_bulk 调优 ──
+# 9/14 18:07 失败直接原因：baostock 服务端 hang，worker login 成功但无 query 返回。
+# 整体硬超时 3 分钟不够 → 提到 5 分钟；worker 内单只股票查询加 30s per-task
+# 主动放弃，避免一只卡死拖垮整批。
+_SYNC_BULK_TIMEOUT_S = 300          # 整体硬超时（原 180s）
+_BS_TASK_TIMEOUT_S = 30             # 单只股票 query 最长等待
+
+
+# ── 模块级 ohlcv 缓存 ──
+# 9/14 fd 撞顶根因之二：8 个策略按 symbol 循环调用 engine.get_ohlcv()，每次
+# with _open_db() 在 Python 3.14 下不 close fd，6 × 666 = ~4000 fd 泄漏，撞
+# ulimit 1024。preload 一次性读全表 → groupby → 共享 dict 引用，内存只 load 一次
+# （实测 ~268 MB），后续 get_ohlcv(symbol) 走 O(1) dict 命中，0 fd 开销。
+# 仅当显式调用 preload_all_ohlcv() 才填充；否则 get_ohlcv 自动 fall back 到旧路径。
+_OHLCV_CACHE: dict[str, pd.DataFrame] | None = None
+_OHLCV_FULL_DF: pd.DataFrame | None = None
+
+
 # ── SQLite 健壮性配置 ──
 # journal_mode=WAL：读写不互斥，sync_today_bulk 写盘时策略仍可读
 # synchronous=NORMAL：WAL 下安全但比 FULL 快很多
@@ -240,6 +258,13 @@ class DataEngine:
         return row[0] if row and row[0] else None
 
     def get_ohlcv(self, symbol: str) -> pd.DataFrame:
+        """取单只股票 OHLCV。优先命中 preload 缓存；未 preload 时走 with-block。
+
+        缓存命中 = 0 sqlite fd；fall back 路径在 Py 3.14 下会泄漏 fd（已修，见
+        _open_db contextmanager），但单测 / 手工跑场景下规模小可接受。
+        """
+        if _OHLCV_CACHE is not None and symbol in _OHLCV_CACHE:
+            return _OHLCV_CACHE[symbol]
         with _open_db(self.db_path) as conn:
             df = pd.read_sql(
                 "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
@@ -247,6 +272,51 @@ class DataEngine:
                 params=(symbol,),
             )
         return df
+
+    def preload_all_ohlcv(self) -> None:
+        """一次性读全表 → groupby → 填到模块级缓存。8 策略共享 dict 引用，
+        内存只 load 一次。失败时 _OHLCV_CACHE 置空 dict 让 get_ohlcv fall back。
+        """
+        global _OHLCV_CACHE, _OHLCV_FULL_DF
+        if _OHLCV_CACHE is not None:
+            # 已被填充（含失败 fallback 的 {}）—— 幂等
+            return
+        try:
+            with _open_db(self.db_path) as conn:
+                df = pd.read_sql(
+                    "SELECT symbol, date, open, high, low, close, volume, turnover "
+                    "FROM stock_daily",
+                    conn,
+                )
+            df = df.sort_values(["symbol", "date"])
+            _OHLCV_FULL_DF = df  # 给 get_all_close_high 用，避免二次 groupby
+            _OHLCV_CACHE = {
+                sym: g.drop(columns=["symbol"]).reset_index(drop=True)
+                for sym, g in df.groupby("symbol", sort=False)
+            }
+            logger.info(f"preload_all_ohlcv 完成: {len(_OHLCV_CACHE)} 只股票")
+        except Exception as exc:
+            logger.warning(
+                f"preload_all_ohlcv 失败，fall back 到逐 symbol 查询: {exc}"
+            )
+            _OHLCV_CACHE = {}  # 标记已尝试，避免每次都重试
+            _OHLCV_FULL_DF = None
+
+    def get_all_close_high(self) -> pd.DataFrame:
+        """rps_breakout 用：返回包含 symbol/date/close/high 四列的全量 DataFrame。
+        优先复用 preload 缓存的原始 df；未 preload 时显式调用一次。
+        """
+        global _OHLCV_FULL_DF
+        if _OHLCV_FULL_DF is None:
+            self.preload_all_ohlcv()
+        if _OHLCV_FULL_DF is None:
+            # preload 失败 → 走 with-block 兜底
+            with _open_db(self.db_path) as conn:
+                return pd.read_sql(
+                    "SELECT symbol, date, close, high FROM stock_daily",
+                    conn,
+                )
+        return _OHLCV_FULL_DF[["symbol", "date", "close", "high"]]
 
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:
