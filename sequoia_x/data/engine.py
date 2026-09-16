@@ -419,6 +419,10 @@ class DataEngine:
         # fillna(0) 把停牌日的 NaN 视为 0，与正常成交量并列保留。
         # 仅剔除 volume < 0 的异常数据（理论上 baostock 不会出现）。
         df = df[df["volume"].fillna(0) >= 0]
+        # 落库前 fillna(0)：避免 pandas NaN → SQLite NULL（语义错位为"数据缺失"）。
+        # 0.0 = 明确"无成交"（停牌/熔断等），符合最初"停牌日 volume/turnover=0"的规划。
+        df["volume"] = df["volume"].fillna(0)
+        df["turnover"] = df["turnover"].fillna(0)
 
         count = len(df)
         with _open_db(self.db_path) as conn:
@@ -554,6 +558,9 @@ class DataEngine:
                 df = df.dropna(subset=["close"])
                 # 保留停牌日（OHLC=前收盘价, volume=NaN→0, turnover=0），与 sync_today_bulk 保持一致。
                 df = df[df["volume"].fillna(0) >= 0]
+                # 落库前 fillna(0)：避免 pandas NaN → SQLite NULL（语义错位）。
+                df["volume"] = df["volume"].fillna(0)
+                df["amount"] = df["amount"].fillna(0)
 
                 if df.empty:
                     skipped += 1
