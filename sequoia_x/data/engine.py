@@ -415,7 +415,10 @@ class DataEngine:
         for col in ["open", "high", "low", "close", "volume", "turnover"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["close"])
-        df = df[df["volume"] > 0]
+        # 保留停牌日：停牌日 baostock 返回 volume=""（→ NaN），OHLC 填充为前收盘价。
+        # fillna(0) 把停牌日的 NaN 视为 0，与正常成交量并列保留。
+        # 仅剔除 volume < 0 的异常数据（理论上 baostock 不会出现）。
+        df = df[df["volume"].fillna(0) >= 0]
 
         count = len(df)
         with _open_db(self.db_path) as conn:
@@ -549,7 +552,8 @@ class DataEngine:
                 for col in ["open", "high", "low", "close", "volume", "amount"]:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
                 df = df.dropna(subset=["close"])
-                df = df[df["volume"] > 0]
+                # 保留停牌日（OHLC=前收盘价, volume=NaN→0, turnover=0），与 sync_today_bulk 保持一致。
+                df = df[df["volume"].fillna(0) >= 0]
 
                 if df.empty:
                     skipped += 1

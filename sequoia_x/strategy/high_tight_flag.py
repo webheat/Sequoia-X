@@ -39,6 +39,11 @@ class HighTightFlagStrategy(BaseStrategy):
                 if len(df) < self._MIN_BARS:
                     continue
 
+                # 防御：跳过当日停牌（vol=0）的股票 —— 停牌日 OHLC=前收盘价，
+                # 缩量条件 `0 < vol_ma20 * 0.6` 会恒真，误触发选股。
+                if df["volume"].iloc[-1] <= 0:
+                    continue
+
                 # 向量化计算各窗口指标
                 tail40 = df.tail(40)
                 tail10 = df.tail(10)
